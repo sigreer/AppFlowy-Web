@@ -1,0 +1,205 @@
+name: Publish sigreer release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Rehearse without registry writes, or publish an approved rehearsal
+        required: true
+        type: choice
+        options:
+          - rehearse
+          - publish
+      release_id:
+        description: Immutable sigreer release identifier
+        required: true
+        type: string
+      source_tag:
+        description: Annotated source tag, normally identical to release_id
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:bb88dcc894d09adc4b1330316a5694e75d57cd121bcb67b5128fcba2d7eca835
+
+jobs:
+  verify-source:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_tag }}
+          fetch-depth: 0
+      - id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${{ inputs.release_id }}" =~ ^sigreer-p2s3-r[1-9][0-9]*$ ]]
+          [[ "${{ inputs.source_tag }}" == "${{ inputs.release_id }}" ]]
+          git fetch --force origin "refs/tags/${{ inputs.source_tag }}:refs/tags/${{ inputs.source_tag }}"
+          test "$(git cat-file -t "refs/tags/${{ inputs.source_tag }}")" = tag
+          peeled=$(git rev-parse "refs/tags/${{ inputs.source_tag }}^{}")
+          test "$(git rev-parse HEAD)" = "$peeled"
+          test -f docker/Dockerfile
+          test -f pnpm-lock.yaml
+          echo "source_sha=$peeled" >>"$GITHUB_OUTPUT"
+
+  verify-own-rehearsal:
+    if: inputs.mode == 'publish'
+    needs: verify-source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Verify own successful identical-tag rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runs=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs?event=workflow_dispatch&status=success&per_page=100")
+          ids=$(jq -r --arg sha "$GITHUB_WORKFLOW_SHA" '.workflow_runs[] | select(.head_sha==$sha) | .id' <<<"$runs")
+          found=false
+          for id in $ids; do
+            artifacts=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${id}/artifacts")
+            while read -r url; do
+              tmp=$(mktemp -d)
+              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$tmp/a.zip"
+              unzip -qq "$tmp/a.zip" -d "$tmp/out"
+              if jq -e --arg tag "${{ inputs.source_tag }}" '.mode=="rehearse" and .source_tag==$tag and .inspected==true' "$tmp"/out/*.json >/dev/null; then found=true; fi
+              rm -rf "$tmp"
+            done < <(jq -r '.artifacts[] | select(.name|startswith("p2s3-result-")) | .archive_download_url' <<<"$artifacts")
+          done
+          test "$found" = true
+
+  build-appflowy-web:
+    needs: verify-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      RECIPE: appflowy-web
+      DOCKERFILE: docker/Dockerfile
+      PACKAGE: appflowy-web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_tag }}
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Verify recipe inputs
+        run: test -f "$DOCKERFILE" && test -f pnpm-lock.yaml
+      - name: Build push:false OCI archive
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          outputs: type=oci,dest=/tmp/appflowy-web.oci
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=appflowy-web-${{ inputs.source_tag }}
+          cache-to: type=gha,mode=max,scope=appflowy-web-${{ inputs.source_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.verify-source.outputs.source_sha }}
+            org.opencontainers.image.version=${{ inputs.release_id }}
+            org.opencontainers.image.title=appflowy-web
+            org.opencontainers.image.description=Sigreer AppFlowy Web release
+            org.opencontainers.image.licenses=AGPL-3.0-only
+      - name: Inspect archive and assert-labels
+        if: inputs.mode == 'rehearse' || inputs.mode == 'publish'
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw=$(docker run --rm -v /tmp:/archives "$SKOPEO_IMAGE" inspect --raw oci-archive:/archives/appflowy-web.oci)
+          PRE_PUSH_MANIFEST_DIGEST="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+          config=$(docker run --rm -v /tmp:/archives "$SKOPEO_IMAGE" inspect --config oci-archive:/archives/appflowy-web.oci)
+          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<<"$config")" = "${{ needs.verify-source.outputs.source_sha }}"
+          config_digest=$(jq -r '.config.digest // "recorded-from-oci-layout"' <<<"$raw")
+          jq -n --arg mode "${{ inputs.mode }}" --arg source_tag "${{ inputs.source_tag }}" --arg source_sha "${{ needs.verify-source.outputs.source_sha }}" \
+            --arg pre_push_manifest_digest "$PRE_PUSH_MANIFEST_DIGEST" --arg config_digest "$config_digest" \
+            '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,inspected:true,pre_push_manifest_digest:$pre_push_manifest_digest,config_digest:$config_digest,base_digests:[],frontend_digest:"recorded-in-build-log"}' > /tmp/result.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2s3-oci-appflowy-web
+          path: /tmp/appflowy-web.oci
+          retention-days: 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2s3-result-appflowy-web
+          path: /tmp/result.json
+          retention-days: 7
+
+  publish:
+    if: inputs.mode == 'publish'
+    needs: [verify-source, verify-own-rehearsal, build-appflowy-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: p2s3-oci-appflowy-web
+          path: /tmp/oci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: p2s3-result-appflowy-web
+          path: /tmp/result
+      - name: Refuse release collision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "checking collision for immutable release tag"
+          code=$(curl -sS -o /tmp/versions -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "${GITHUB_API_URL}/users/${GITHUB_REPOSITORY_OWNER,,}/packages/container/appflowy-web/versions?per_page=100")
+          if test "$code" = 200; then
+            ! jq -e --arg tag "${{ inputs.release_id }}" 'any(.[]; .metadata.container.tags | index($tag))' /tmp/versions >/dev/null
+          else
+            test "$code" = 404
+          fi
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+          logout: true
+      - name: Copy OCI archive directly and assert registry digest
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/appflowy-web:${{ inputs.release_id }}"
+          docker run --rm -v /tmp/oci:/archives -v "$HOME/.docker:/root/.docker:ro" "$SKOPEO_IMAGE" copy --all oci-archive:/archives/appflowy-web.oci "docker://$image"
+          PRE_PUSH_MANIFEST_DIGEST=$(jq -r .pre_push_manifest_digest /tmp/result/result.json)
+          REGISTRY_MANIFEST_DIGEST=$(docker run --rm -v "$HOME/.docker:/root/.docker:ro" "$SKOPEO_IMAGE" inspect --format '{{.Digest}}' "docker://$image")
+          test "$PRE_PUSH_MANIFEST_DIGEST" = "$REGISTRY_MANIFEST_DIGEST"
+          echo "registry_manifest_digest=$REGISTRY_MANIFEST_DIGEST" >>"$GITHUB_OUTPUT"
+          jq --arg registry_manifest_digest "$REGISTRY_MANIFEST_DIGEST" '.registry_manifest_digest=$registry_manifest_digest' /tmp/result/result.json > /tmp/published.json
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/appflowy-web
+          subject-digest: ${{ steps.publish.outputs.registry_manifest_digest }}
+          push-to-registry: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2s3-published-appflowy-web
+          path: /tmp/published.json
+          retention-days: 7
