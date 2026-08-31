@@ -25,6 +25,57 @@ permissions:
 
 env:
   SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:bb88dcc894d09adc4b1330316a5694e75d57cd121bcb67b5128fcba2d7eca835
+  BUILDX_METADATA_PROVENANCE: max
+  INSPECT_OCI_SCRIPT: |
+    verify_blob() {
+      local layout=$1 digest=$2 hex blob actual
+      [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+      hex=${digest#sha256:}; blob="$layout/blobs/sha256/$hex"
+      test -f "$blob"
+      actual=$(sha256sum "$blob" | cut -d' ' -f1)
+      test "$actual" = "$hex"
+    }
+    extract_oci_archive() {
+      local archive=$1 root_digest root_blob root_type manifest_blob
+      OCI_LAYOUT=$(mktemp -d); tar -xf "$archive" -C "$OCI_LAYOUT"
+      test "$(jq -r '.manifests | length' "$OCI_LAYOUT/index.json")" = 1
+      root_digest=$(jq -er '.manifests[0].digest' "$OCI_LAYOUT/index.json")
+      verify_blob "$OCI_LAYOUT" "$root_digest"
+      root_blob="$OCI_LAYOUT/blobs/sha256/${root_digest#sha256:}"
+      root_type=$(jq -r '.mediaType' "$root_blob")
+      if [[ "$root_type" == *image.index* || "$root_type" == *manifest.list* ]]; then
+        PRE_PUSH_MANIFEST_DIGEST=$(jq -er '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")] | if length==1 then .[0].digest else error("amd64 manifest cardinality") end' "$root_blob")
+      else PRE_PUSH_MANIFEST_DIGEST=$root_digest; fi
+      verify_blob "$OCI_LAYOUT" "$PRE_PUSH_MANIFEST_DIGEST"
+      manifest_blob="$OCI_LAYOUT/blobs/sha256/${PRE_PUSH_MANIFEST_DIGEST#sha256:}"
+      CONFIG_DIGEST=$(jq -er '.config.digest' "$manifest_blob")
+      verify_blob "$OCI_LAYOUT" "$CONFIG_DIGEST"
+      CONFIG_BLOB="$OCI_LAYOUT/blobs/sha256/${CONFIG_DIGEST#sha256:}"
+    }
+    resolve_external_inputs() {
+      BUILDKIT_MATERIALS=$(jq -cer '.["buildx.build.provenance"].materials | select(type=="array" and length>0)' <<<"$BUILD_METADATA")
+      BASE_DIGESTS='[]'
+      while IFS= read -r ref; do
+        test -n "$ref"
+        repository=${ref%%:*}
+        material=$(jq -cer --arg repository "$repository" '[.[] | select(.uri | contains($repository))] | if length==1 then .[0] else error("base material cardinality") end' <<<"$BUILDKIT_MATERIALS")
+        digest="sha256:$(jq -er '.digest.sha256' <<<"$material")"
+        [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+        BASE_DIGESTS=$(jq -cn --argjson old "$BASE_DIGESTS" --arg reference "$ref" --arg digest "$digest" --argjson material "$material" '$old + [{reference:$reference,digest:$digest,material:$material}]')
+      done <<<"$BASE_REFS"
+      test "$(jq 'length' <<<"$BASE_DIGESTS")" -gt 0
+      FRONTEND_DIGEST=$(docker run --rm "$SKOPEO_IMAGE" inspect --format '{{.Digest}}' "docker://$FRONTEND_REF")
+      [[ "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+    }
+    assert_label() { local key=$1 expected=$2 actual; actual=$(jq -er --arg key "$key" '.config.Labels[$key]' "$CONFIG_BLOB"); test "$actual" = "$expected"; }
+    assert_all_labels() {
+      assert_label org.opencontainers.image.source "$EXPECTED_SOURCE"
+      assert_label org.opencontainers.image.revision "$EXPECTED_REVISION"
+      assert_label org.opencontainers.image.version "$EXPECTED_VERSION"
+      assert_label org.opencontainers.image.title "$EXPECTED_TITLE"
+      assert_label org.opencontainers.image.description "$EXPECTED_DESCRIPTION"
+      assert_label org.opencontainers.image.licenses "$EXPECTED_LICENSES"
+    }
 
 jobs:
   verify-source:
@@ -68,7 +119,8 @@ jobs:
           set -euo pipefail
           runs=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs?event=workflow_dispatch&status=success&per_page=100")
-          ids=$(jq -r --arg sha "$GITHUB_WORKFLOW_SHA" '.workflow_runs[] | select(.head_sha==$sha) | .id' <<<"$runs")
+          sha="${{ needs.verify-source.outputs.source_sha }}"
+          ids=$(jq -r --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '.workflow_runs[] | select(.head_sha==$workflow_sha) | .id' <<<"$runs")
           found=false
           for id in $ids; do
             artifacts=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
@@ -77,7 +129,7 @@ jobs:
               tmp=$(mktemp -d)
               curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$tmp/a.zip"
               unzip -qq "$tmp/a.zip" -d "$tmp/out"
-              if jq -e --arg tag "${{ inputs.source_tag }}" '.mode=="rehearse" and .source_tag==$tag and .inspected==true' "$tmp"/out/*.json >/dev/null; then found=true; fi
+              if jq -e --arg tag "${{ inputs.source_tag }}" --arg sha "$sha" '.mode=="rehearse" and .source_tag==$tag and .source_sha==$sha and .inspected==true' "$tmp"/out/*.json >/dev/null; then found=true; fi
               rm -rf "$tmp"
             done < <(jq -r '.artifacts[] | select(.name|startswith("p2s3-result-")) | .archive_download_url' <<<"$artifacts")
           done
@@ -102,6 +154,7 @@ jobs:
       - name: Verify recipe inputs
         run: test -f "$DOCKERFILE" && test -f pnpm-lock.yaml
       - name: Build push:false OCI archive
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
@@ -122,17 +175,27 @@ jobs:
             org.opencontainers.image.licenses=AGPL-3.0-only
       - name: Inspect archive and assert-labels
         if: inputs.mode == 'rehearse' || inputs.mode == 'publish'
+        env:
+          BASE_REFS: |-
+            node:20.12.0-alpine
+            nginx:1.25-alpine
+          FRONTEND_REF: docker/dockerfile:1
+          EXPECTED_SOURCE: https://github.com/${{ github.repository }}
+          EXPECTED_REVISION: ${{ needs.verify-source.outputs.source_sha }}
+          EXPECTED_VERSION: ${{ inputs.release_id }}
+          EXPECTED_TITLE: appflowy-web
+          EXPECTED_DESCRIPTION: Sigreer AppFlowy Web release
+          EXPECTED_LICENSES: AGPL-3.0-only
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
         shell: bash
         run: |
           set -euo pipefail
-          raw=$(docker run --rm -v /tmp:/archives "$SKOPEO_IMAGE" inspect --raw oci-archive:/archives/appflowy-web.oci)
-          PRE_PUSH_MANIFEST_DIGEST="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
-          config=$(docker run --rm -v /tmp:/archives "$SKOPEO_IMAGE" inspect --config oci-archive:/archives/appflowy-web.oci)
-          test "$(jq -r '.config.Labels["org.opencontainers.image.revision"]' <<<"$config")" = "${{ needs.verify-source.outputs.source_sha }}"
-          config_digest=$(jq -r '.config.digest // "recorded-from-oci-layout"' <<<"$raw")
-          jq -n --arg mode "${{ inputs.mode }}" --arg source_tag "${{ inputs.source_tag }}" --arg source_sha "${{ needs.verify-source.outputs.source_sha }}" \
-            --arg pre_push_manifest_digest "$PRE_PUSH_MANIFEST_DIGEST" --arg config_digest "$config_digest" \
-            '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,inspected:true,pre_push_manifest_digest:$pre_push_manifest_digest,config_digest:$config_digest,base_digests:[],frontend_digest:"recorded-in-build-log"}' > /tmp/result.json
+          eval "$INSPECT_OCI_SCRIPT"
+          extract_oci_archive /tmp/appflowy-web.oci
+          resolve_external_inputs
+          assert_all_labels
+          source_sha="${{ needs.verify-source.outputs.source_sha }}"
+          jq -n --arg mode "${{ inputs.mode }}" --arg source_tag "${{ inputs.source_tag }}" --arg source_sha "$source_sha" --arg manifest "$PRE_PUSH_MANIFEST_DIGEST" --arg config "$CONFIG_DIGEST" --argjson bases "$BASE_DIGESTS" --argjson materials "$BUILDKIT_MATERIALS" --arg frontend "$FRONTEND_DIGEST" '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,inspected:true,pre_push_manifest_digest:$manifest,registry_manifest_digest:false,config_digest:$config,base_digests:$bases,buildkit_materials:$materials,frontend_digest:$frontend}' >/tmp/result.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2s3-oci-appflowy-web
@@ -168,13 +231,16 @@ jobs:
         run: |
           set -euo pipefail
           echo "checking collision for immutable release tag"
-          code=$(curl -sS -o /tmp/versions -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "${GITHUB_API_URL}/users/${GITHUB_REPOSITORY_OWNER,,}/packages/container/appflowy-web/versions?per_page=100")
-          if test "$code" = 200; then
-            ! jq -e --arg tag "${{ inputs.release_id }}" 'any(.[]; .metadata.container.tags | index($tag))' /tmp/versions >/dev/null
-          else
-            test "$code" = 404
+          if ! pages=$(gh api --paginate --slurp "/users/${GITHUB_REPOSITORY_OWNER,,}/packages/container/appflowy-web/versions?per_page=100" 2>/tmp/gh-error); then
+            grep -q 'HTTP 404' /tmp/gh-error || { cat /tmp/gh-error >&2; exit 1; }
+            pages='[[]]'
           fi
+          collision_malformed=$(jq '[.[][] | select((.name|type)!="string" or (.metadata.container.tags|type)!="array")] | length' <<<"$pages")
+          collision_matches=$(jq --arg tag "${{ inputs.release_id }}" '[.[][] | select(.metadata.container.tags | index($tag))] | length' <<<"$pages")
+          collision_duplicates=$(jq --arg tag "${{ inputs.release_id }}" '[.[][] | select(.metadata.container.tags | index($tag)) | .name] | length - (unique|length)' <<<"$pages")
+          test "$collision_malformed" = 0
+          test "$collision_matches" = 0
+          test "$collision_duplicates" = 0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
