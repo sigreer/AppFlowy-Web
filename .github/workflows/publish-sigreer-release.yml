@@ -43,11 +43,12 @@ env:
       verify_blob "$OCI_LAYOUT" "$root_digest"
       root_blob="$OCI_LAYOUT/blobs/sha256/${root_digest#sha256:}"
       root_type=$(jq -r '.mediaType' "$root_blob")
+      PRE_PUSH_MANIFEST_DIGEST=$root_digest
       if [[ "$root_type" == *image.index* || "$root_type" == *manifest.list* ]]; then
-        PRE_PUSH_MANIFEST_DIGEST=$(jq -er '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")] | if length==1 then .[0].digest else error("amd64 manifest cardinality") end' "$root_blob")
-      else PRE_PUSH_MANIFEST_DIGEST=$root_digest; fi
-      verify_blob "$OCI_LAYOUT" "$PRE_PUSH_MANIFEST_DIGEST"
-      manifest_blob="$OCI_LAYOUT/blobs/sha256/${PRE_PUSH_MANIFEST_DIGEST#sha256:}"
+        PLATFORM_MANIFEST_DIGEST=$(jq -er '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64")] | if length==1 then .[0].digest else error("amd64 manifest cardinality") end' "$root_blob")
+      else PLATFORM_MANIFEST_DIGEST=$root_digest; fi
+      verify_blob "$OCI_LAYOUT" "$PLATFORM_MANIFEST_DIGEST"
+      manifest_blob="$OCI_LAYOUT/blobs/sha256/${PLATFORM_MANIFEST_DIGEST#sha256:}"
       CONFIG_DIGEST=$(jq -er '.config.digest' "$manifest_blob")
       verify_blob "$OCI_LAYOUT" "$CONFIG_DIGEST"
       CONFIG_BLOB="$OCI_LAYOUT/blobs/sha256/${CONFIG_DIGEST#sha256:}"
@@ -64,7 +65,9 @@ env:
         BASE_DIGESTS=$(jq -cn --argjson old "$BASE_DIGESTS" --arg reference "$ref" --arg digest "$digest" --argjson material "$material" '$old + [{reference:$reference,digest:$digest,material:$material}]')
       done <<<"$BASE_REFS"
       test "$(jq 'length' <<<"$BASE_DIGESTS")" -gt 0
-      FRONTEND_DIGEST=$(docker run --rm "$SKOPEO_IMAGE" inspect --format '{{.Digest}}' "docker://$FRONTEND_REF")
+      frontend_repository=${FRONTEND_REF%%:*}
+      FRONTEND_IDENTITY=$(jq -cer --arg repository "$frontend_repository" '[.[] | select(.uri | contains($repository))] | if length==1 then .[0] else error("frontend material cardinality") end' <<<"$BUILDKIT_MATERIALS")
+      FRONTEND_DIGEST="sha256:$(jq -er '.digest.sha256' <<<"$FRONTEND_IDENTITY")"
       [[ "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
     }
     assert_label() { local key=$1 expected=$2 actual; actual=$(jq -er --arg key "$key" '.config.Labels[$key]' "$CONFIG_BLOB"); test "$actual" = "$expected"; }
@@ -195,7 +198,7 @@ jobs:
           resolve_external_inputs
           assert_all_labels
           source_sha="${{ needs.verify-source.outputs.source_sha }}"
-          jq -n --arg mode "${{ inputs.mode }}" --arg source_tag "${{ inputs.source_tag }}" --arg source_sha "$source_sha" --arg manifest "$PRE_PUSH_MANIFEST_DIGEST" --arg config "$CONFIG_DIGEST" --argjson bases "$BASE_DIGESTS" --argjson materials "$BUILDKIT_MATERIALS" --arg frontend "$FRONTEND_DIGEST" '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,inspected:true,pre_push_manifest_digest:$manifest,registry_manifest_digest:false,config_digest:$config,base_digests:$bases,buildkit_materials:$materials,frontend_digest:$frontend}' >/tmp/result.json
+          jq -n --arg mode "${{ inputs.mode }}" --arg source_tag "${{ inputs.source_tag }}" --arg source_sha "$source_sha" --arg root "$PRE_PUSH_MANIFEST_DIGEST" --arg platform "$PLATFORM_MANIFEST_DIGEST" --arg config "$CONFIG_DIGEST" --argjson bases "$BASE_DIGESTS" --argjson materials "$BUILDKIT_MATERIALS" --arg frontend "$FRONTEND_DIGEST" --argjson frontend_identity "$FRONTEND_IDENTITY" '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,inspected:true,pre_push_manifest_digest:$root,platform_manifest_digest:$platform,registry_manifest_digest:false,config_digest:$config,base_digests:$bases,buildkit_materials:$materials,frontend_digest:$frontend,frontend_identity:$frontend_identity}' >/tmp/result.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2s3-oci-appflowy-web
