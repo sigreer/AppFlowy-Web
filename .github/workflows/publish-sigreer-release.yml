@@ -131,24 +131,27 @@ jobs:
           workflow_id=$(jq -er '.id' <<<"$workflow")
           runs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/publish-sigreer-release.yml/runs" -f event=workflow_dispatch -f status=success -f per_page=100)
           sha="${{ needs.verify-source.outputs.source_sha }}"
-          ids=$(jq -r --argjson workflow_id "$workflow_id" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '.workflow_runs[] | select(.workflow_id==$workflow_id and .path==".github/workflows/publish-sigreer-release.yml" and .name=="Publish sigreer release" and .head_sha==$workflow_sha and .event=="workflow_dispatch" and .conclusion=="success") | .id' <<<"$runs")
+          ids=$(jq -r --argjson workflow_id "$workflow_id" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '[.workflow_runs[] | select(.workflow_id==$workflow_id and .path==".github/workflows/publish-sigreer-release.yml" and .name=="Publish sigreer release" and .head_sha==$workflow_sha and .event=="workflow_dispatch" and .conclusion=="success")] | sort_by(.created_at)|reverse | .[].id' <<<"$runs")
           found=false
           for id in $ids; do
-            artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts")
+            candidate_dir=$(mktemp -d); candidate_rejected=false
+            if ! artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts"); then rm -rf "$candidate_dir"; continue; fi
             artifact_inventory=$(jq -c '[.artifacts[] | select(.name|startswith("p2s3-result-"))]' <<<"$artifacts")
+            expired_artifacts=$(jq '[.[] | select(.expired==true)] | length' <<<"$artifact_inventory")
             unexpected_artifacts=$(jq '[.[] | select(.name != "p2s3-result-appflowy-web")] | length' <<<"$artifact_inventory")
             duplicate_artifacts=$(jq '[group_by(.name)[] | select(length != 1)] | length' <<<"$artifact_inventory")
             missing_artifacts=$(jq 'if ([.[].name] == ["p2s3-result-appflowy-web"]) then 0 else 1 end' <<<"$artifact_inventory")
-            test "$unexpected_artifacts" = 0 && test "$duplicate_artifacts" = 0 && test "$missing_artifacts" = 0 || continue
-            tmp=$(mktemp -d); mkdir "$tmp/p2s3-result-appflowy-web"
+            if test "$expired_artifacts" != 0 || test "$unexpected_artifacts" != 0 || test "$duplicate_artifacts" != 0 || test "$missing_artifacts" != 0; then rm -rf "$candidate_dir"; continue; fi
+            mkdir "$candidate_dir/p2s3-result-appflowy-web"
             url=$(jq -er '.[0].archive_download_url' <<<"$artifact_inventory")
-            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$tmp/result.zip"
-            unzip -qq "$tmp/result.zip" -d "$tmp/p2s3-result-appflowy-web"
-            test "$(find "$tmp/p2s3-result-appflowy-web" -type f -name result.json | wc -l)" = 1
-            result="$tmp/p2s3-result-appflowy-web/result.json"
+            if ! curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$candidate_dir/result.zip" || ! unzip -qq "$candidate_dir/result.zip" -d "$candidate_dir/p2s3-result-appflowy-web"; then candidate_rejected=true; fi
+            if test "$candidate_rejected" = true || test "$(find "$candidate_dir/p2s3-result-appflowy-web" -type f -name result.json | wc -l)" != 1; then rm -rf "$candidate_dir"; continue; fi
+            result="$candidate_dir/p2s3-result-appflowy-web/result.json"
             distinct_recipes=$(jq -r '.recipe' "$result" | sort -u | wc -l)
-            if jq -e --arg tag "$INPUT_SOURCE_TAG" --arg sha "$sha" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" --argjson run_id "$id" '.recipe=="appflowy-web" and .mode=="rehearse" and .source_tag==$tag and .source_sha==$sha and .workflow_sha==$workflow_sha and .run_id==$run_id and .inspected==true' "$result" >/dev/null && test "$distinct_recipes" = 1; then found=true; fi
-            rm -rf "$tmp"
+            if ! jq -e --arg tag "$INPUT_SOURCE_TAG" --arg sha "$sha" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" --argjson run_id "$id" '.recipe=="appflowy-web" and .mode=="rehearse" and .source_tag==$tag and .source_sha==$sha and .workflow_sha==$workflow_sha and .run_id==$run_id and .inspected==true' "$result" >/dev/null || test "$distinct_recipes" != 1; then candidate_rejected=true; fi
+            rm -rf "$candidate_dir"
+            if test "$candidate_rejected" = true; then continue; fi
+            found=true; break
           done
           test "$found" = true
 
