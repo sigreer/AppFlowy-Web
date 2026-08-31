@@ -31,7 +31,8 @@ env:
   INPUT_MODE: ${{ inputs.mode }}
   INPUT_RELEASE_ID: ${{ inputs.release_id }}
   INPUT_SOURCE_TAG: ${{ inputs.source_tag }}
-  SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:bb88dcc894d09adc4b1330316a5694e75d57cd121bcb67b5128fcba2d7eca835
+  SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:0e392474a4383b733038b85eff26ade929d2ff10e8deead25a6add3ed79fb362
+  SKOPEO_SOURCE_INDEX: quay.io/skopeo/stable@sha256:4a16d57b37617a04b3d643079a477a2848efe892dffcdf0ce56df4262b65f810
   BUILDX_METADATA_PROVENANCE: max
   INSPECT_OCI_SCRIPT: |
     verify_blob() {
@@ -161,7 +162,7 @@ jobs:
           test "$found" = true
 
   build-appflowy-web:
-    needs: verify-source
+    needs: [verify-source, verify-publish-helper]
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -240,6 +241,23 @@ jobs:
           name: p2s3-result-appflowy-web
           path: /tmp/result.json
           retention-days: 7
+
+  verify-publish-helper:
+    needs: verify-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Verify immutable linux-amd64 publish helper
+        run: |
+          set -euo pipefail
+          helper_digest=${SKOPEO_IMAGE##*@}
+          index=$(docker manifest inspect "$SKOPEO_SOURCE_INDEX")
+          matches=$(jq --arg helper_digest "$helper_digest" '[.manifests[] | select(.platform.os=="linux" and .platform.architecture=="amd64" and .digest==$helper_digest)] | length' <<<"$index")
+          test "$matches" -eq 1
+          docker pull --platform linux/amd64 "$SKOPEO_IMAGE"
+          docker run --rm --platform linux/amd64 "$SKOPEO_IMAGE" --version
 
   publish:
     if: inputs.mode == 'publish'
