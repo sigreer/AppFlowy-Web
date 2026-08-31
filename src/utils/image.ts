@@ -184,8 +184,8 @@ export interface CheckImageOptions {
    * the browser HTTP cache so we always re-ask the origin — defends against
    * a misbehaving proxy that cached a transient failure. First attempts use
    * the default cache mode so successful responses (which the server tags
-   * `Cache-Control: public, immutable, max-age=31536000`) can be reused
-   * across mounts without a network round-trip.
+   * `Cache-Control: private, immutable, max-age=31536000` with
+   * `Vary: Authorization`) can be reused across mounts without a network round-trip.
    */
   retry?: boolean;
   /**
