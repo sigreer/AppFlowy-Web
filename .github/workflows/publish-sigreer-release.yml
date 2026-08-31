@@ -23,7 +23,14 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: p2s3-publication-${{ github.repository }}-${{ inputs.release_id }}
+  cancel-in-progress: false
+
 env:
+  INPUT_MODE: ${{ inputs.mode }}
+  INPUT_RELEASE_ID: ${{ inputs.release_id }}
+  INPUT_SOURCE_TAG: ${{ inputs.source_tag }}
   SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:bb88dcc894d09adc4b1330316a5694e75d57cd121bcb67b5128fcba2d7eca835
   BUILDX_METADATA_PROVENANCE: max
   INSPECT_OCI_SCRIPT: |
@@ -96,11 +103,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "${{ inputs.release_id }}" =~ ^sigreer-p2s3-r[1-9][0-9]*$ ]]
-          [[ "${{ inputs.source_tag }}" == "${{ inputs.release_id }}" ]]
-          git fetch --force origin "refs/tags/${{ inputs.source_tag }}:refs/tags/${{ inputs.source_tag }}"
-          test "$(git cat-file -t "refs/tags/${{ inputs.source_tag }}")" = tag
-          peeled=$(git rev-parse "refs/tags/${{ inputs.source_tag }}^{}")
+          [[ "$INPUT_RELEASE_ID" =~ ^sigreer-p2s3-r[1-9][0-9]*$ ]]
+          [[ "$INPUT_SOURCE_TAG" == "$INPUT_RELEASE_ID" ]]
+          git fetch --force origin "refs/tags/$INPUT_SOURCE_TAG:refs/tags/$INPUT_SOURCE_TAG"
+          test "$(git cat-file -t "refs/tags/$INPUT_SOURCE_TAG")" = tag
+          peeled=$(git rev-parse "refs/tags/$INPUT_SOURCE_TAG^{}")
           test "$(git rev-parse HEAD)" = "$peeled"
           test -f docker/Dockerfile
           test -f pnpm-lock.yaml
@@ -120,21 +127,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          runs=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs?event=workflow_dispatch&status=success&per_page=100")
+          workflow=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/publish-sigreer-release.yml")
+          workflow_id=$(jq -er '.id' <<<"$workflow")
+          runs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/publish-sigreer-release.yml/runs" -f event=workflow_dispatch -f status=success -f per_page=100)
           sha="${{ needs.verify-source.outputs.source_sha }}"
-          ids=$(jq -r --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '.workflow_runs[] | select(.head_sha==$workflow_sha) | .id' <<<"$runs")
+          ids=$(jq -r --argjson workflow_id "$workflow_id" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '.workflow_runs[] | select(.workflow_id==$workflow_id and .path==".github/workflows/publish-sigreer-release.yml" and .name=="Publish sigreer release" and .head_sha==$workflow_sha and .event=="workflow_dispatch" and .conclusion=="success") | .id' <<<"$runs")
           found=false
           for id in $ids; do
-            artifacts=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${id}/artifacts")
-            while read -r url; do
-              tmp=$(mktemp -d)
-              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$tmp/a.zip"
-              unzip -qq "$tmp/a.zip" -d "$tmp/out"
-              if jq -e --arg tag "${{ inputs.source_tag }}" --arg sha "$sha" '.mode=="rehearse" and .source_tag==$tag and .source_sha==$sha and .inspected==true' "$tmp"/out/*.json >/dev/null; then found=true; fi
-              rm -rf "$tmp"
-            done < <(jq -r '.artifacts[] | select(.name|startswith("p2s3-result-")) | .archive_download_url' <<<"$artifacts")
+            artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts")
+            artifact_inventory=$(jq -c '[.artifacts[] | select(.name|startswith("p2s3-result-"))]' <<<"$artifacts")
+            unexpected_artifacts=$(jq '[.[] | select(.name != "p2s3-result-appflowy-web")] | length' <<<"$artifact_inventory")
+            duplicate_artifacts=$(jq '[group_by(.name)[] | select(length != 1)] | length' <<<"$artifact_inventory")
+            missing_artifacts=$(jq 'if ([.[].name] == ["p2s3-result-appflowy-web"]) then 0 else 1 end' <<<"$artifact_inventory")
+            test "$unexpected_artifacts" = 0 && test "$duplicate_artifacts" = 0 && test "$missing_artifacts" = 0 || continue
+            tmp=$(mktemp -d); mkdir "$tmp/p2s3-result-appflowy-web"
+            url=$(jq -er '.[0].archive_download_url' <<<"$artifact_inventory")
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$tmp/result.zip"
+            unzip -qq "$tmp/result.zip" -d "$tmp/p2s3-result-appflowy-web"
+            test "$(find "$tmp/p2s3-result-appflowy-web" -type f -name result.json | wc -l)" = 1
+            result="$tmp/p2s3-result-appflowy-web/result.json"
+            distinct_recipes=$(jq -r '.recipe' "$result" | sort -u | wc -l)
+            if jq -e --arg tag "$INPUT_SOURCE_TAG" --arg sha "$sha" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" --argjson run_id "$id" '.recipe=="appflowy-web" and .mode=="rehearse" and .source_tag==$tag and .source_sha==$sha and .workflow_sha==$workflow_sha and .run_id==$run_id and .inspected==true' "$result" >/dev/null && test "$distinct_recipes" = 1; then found=true; fi
+            rm -rf "$tmp"
           done
           test "$found" = true
 
@@ -198,7 +212,7 @@ jobs:
           resolve_external_inputs
           assert_all_labels
           source_sha="${{ needs.verify-source.outputs.source_sha }}"
-          jq -n --arg mode "${{ inputs.mode }}" --arg source_tag "${{ inputs.source_tag }}" --arg source_sha "$source_sha" --arg root "$PRE_PUSH_MANIFEST_DIGEST" --arg platform "$PLATFORM_MANIFEST_DIGEST" --arg config "$CONFIG_DIGEST" --argjson bases "$BASE_DIGESTS" --argjson materials "$BUILDKIT_MATERIALS" --arg frontend "$FRONTEND_DIGEST" --argjson frontend_identity "$FRONTEND_IDENTITY" '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,inspected:true,pre_push_manifest_digest:$root,platform_manifest_digest:$platform,registry_manifest_digest:false,config_digest:$config,base_digests:$bases,buildkit_materials:$materials,frontend_digest:$frontend,frontend_identity:$frontend_identity}' >/tmp/result.json
+          jq -n --arg mode "$INPUT_MODE" --arg source_tag "$INPUT_SOURCE_TAG" --arg source_sha "$source_sha" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" --argjson run_id "$GITHUB_RUN_ID" --arg root "$PRE_PUSH_MANIFEST_DIGEST" --arg platform "$PLATFORM_MANIFEST_DIGEST" --arg config "$CONFIG_DIGEST" --argjson bases "$BASE_DIGESTS" --argjson materials "$BUILDKIT_MATERIALS" --arg frontend "$FRONTEND_DIGEST" --argjson frontend_identity "$FRONTEND_IDENTITY" '{recipe:"appflowy-web",mode:$mode,source_tag:$source_tag,source_sha:$source_sha,workflow_sha:$workflow_sha,run_id:$run_id,inspected:true,pre_push_manifest_digest:$root,platform_manifest_digest:$platform,registry_manifest_digest:false,config_digest:$config,base_digests:$bases,buildkit_materials:$materials,frontend_digest:$frontend,frontend_identity:$frontend_identity}' >/tmp/result.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2s3-oci-appflowy-web
@@ -239,8 +253,8 @@ jobs:
             pages='[[]]'
           fi
           collision_malformed=$(jq '[.[][] | select((.name|type)!="string" or (.metadata.container.tags|type)!="array")] | length' <<<"$pages")
-          collision_matches=$(jq --arg tag "${{ inputs.release_id }}" '[.[][] | select(.metadata.container.tags | index($tag))] | length' <<<"$pages")
-          collision_duplicates=$(jq --arg tag "${{ inputs.release_id }}" '[.[][] | select(.metadata.container.tags | index($tag)) | .name] | length - (unique|length)' <<<"$pages")
+          collision_matches=$(jq --arg tag "$INPUT_RELEASE_ID" '[.[][] | select(.metadata.container.tags | index($tag))] | length' <<<"$pages")
+          collision_duplicates=$(jq --arg tag "$INPUT_RELEASE_ID" '[.[][] | select(.metadata.container.tags | index($tag)) | .name] | length - (unique|length)' <<<"$pages")
           test "$collision_malformed" = 0
           test "$collision_matches" = 0
           test "$collision_duplicates" = 0
@@ -255,7 +269,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/appflowy-web:${{ inputs.release_id }}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/appflowy-web:$INPUT_RELEASE_ID"
           docker run --rm -v /tmp/oci:/archives -v "$HOME/.docker:/root/.docker:ro" "$SKOPEO_IMAGE" copy --all oci-archive:/archives/appflowy-web.oci "docker://$image"
           PRE_PUSH_MANIFEST_DIGEST=$(jq -r .pre_push_manifest_digest /tmp/result/result.json)
           REGISTRY_MANIFEST_DIGEST=$(docker run --rm -v "$HOME/.docker:/root/.docker:ro" "$SKOPEO_IMAGE" inspect --format '{{.Digest}}' "docker://$image")
