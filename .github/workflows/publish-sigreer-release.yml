@@ -299,15 +299,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
           logout: true
+      - name: Verify helper consumes registry credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry_login=$(docker run --rm -v "$HOME/.docker/config.json:/tmp/auth.json:ro" "$SKOPEO_IMAGE" login --get-login ghcr.io)
+          test "$registry_login" = "$GITHUB_ACTOR"
       - name: Copy OCI archive directly and assert registry digest
         id: publish
         shell: bash
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/appflowy-web:$INPUT_RELEASE_ID"
-          docker run --rm -v /tmp/oci:/archives -v "$HOME/.docker:/root/.docker:ro" "$SKOPEO_IMAGE" copy --all oci-archive:/archives/appflowy-web.oci "docker://$image"
+          docker run --rm -v /tmp/oci:/archives -v "$HOME/.docker/config.json:/tmp/auth.json:ro" "$SKOPEO_IMAGE" copy --all oci-archive:/archives/appflowy-web.oci "docker://$image"
           PRE_PUSH_MANIFEST_DIGEST=$(jq -r .pre_push_manifest_digest /tmp/result/result.json)
-          REGISTRY_MANIFEST_DIGEST=$(docker run --rm -v "$HOME/.docker:/root/.docker:ro" "$SKOPEO_IMAGE" inspect --format '{{.Digest}}' "docker://$image")
+          REGISTRY_MANIFEST_DIGEST=$(docker run --rm -v "$HOME/.docker/config.json:/tmp/auth.json:ro" "$SKOPEO_IMAGE" inspect --format '{{.Digest}}' "docker://$image")
           test "$PRE_PUSH_MANIFEST_DIGEST" = "$REGISTRY_MANIFEST_DIGEST"
           echo "registry_manifest_digest=$REGISTRY_MANIFEST_DIGEST" >>"$GITHUB_OUTPUT"
           jq --arg registry_manifest_digest "$REGISTRY_MANIFEST_DIGEST" '.registry_manifest_digest=$registry_manifest_digest' /tmp/result/result.json > /tmp/published.json
