@@ -61,7 +61,7 @@ env:
       CONFIG_BLOB="$OCI_LAYOUT/blobs/sha256/${CONFIG_DIGEST#sha256:}"
     }
     resolve_external_inputs() {
-      BUILDKIT_MATERIALS=$(jq -cer '.["buildx.build.provenance"].materials | select(type=="array" and length>0)' <<<"$BUILD_METADATA")
+      BUILDKIT_MATERIALS=$(jq -cer '.["buildx.build.provenance"].materials | select(type=="array" and length>0)' "$BUILD_METADATA_FILE")
       BASE_DIGESTS='[]'
       while IFS= read -r ref; do
         test -n "$ref"
@@ -198,6 +198,15 @@ jobs:
             org.opencontainers.image.title=appflowy-web
             org.opencontainers.image.description=Sigreer AppFlowy Web release
             org.opencontainers.image.licenses=AGPL-3.0-only
+      - name: Materialize bounded Buildx metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' metadata_files < <(find "$RUNNER_TEMP" -path '*/docker-actions-toolkit-*' -type f -name 'build-metadata-*.json' -print0)
+          test "${#metadata_files[@]}" -eq 1
+          install -m 0600 "${metadata_files[0]}" /tmp/appflowy-web-build-metadata.json
+          BUILD_METADATA_FILE=/tmp/appflowy-web-build-metadata.json
+          jq -e . "$BUILD_METADATA_FILE" >/dev/null
       - name: Inspect archive and assert-labels
         if: inputs.mode == 'rehearse' || inputs.mode == 'publish'
         env:
@@ -211,7 +220,7 @@ jobs:
           EXPECTED_TITLE: appflowy-web
           EXPECTED_DESCRIPTION: Sigreer AppFlowy Web release
           EXPECTED_LICENSES: AGPL-3.0-only
-          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+          BUILD_METADATA_FILE: /tmp/appflowy-web-build-metadata.json
         shell: bash
         run: |
           set -euo pipefail
