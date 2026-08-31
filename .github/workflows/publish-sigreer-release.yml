@@ -129,9 +129,14 @@ jobs:
           set -euo pipefail
           workflow=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/publish-sigreer-release.yml")
           workflow_id=$(jq -er '.id' <<<"$workflow")
-          runs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/publish-sigreer-release.yml/runs" -f event=workflow_dispatch -f status=success -f per_page=100)
+          run_pages=$(gh api --paginate --slurp -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/publish-sigreer-release.yml/runs" -f event=workflow_dispatch -f status=success -f per_page=100)
+          malformed_run_pages=$(jq '[.[] | select(type!="object" or (.workflow_runs|type)!="array")] | length' <<<"$run_pages")
+          test "$malformed_run_pages" = 0
+          flattened_runs=$(jq -ce '[.[] | .workflow_runs[] | select(type=="object" and (.id|type)=="number" and (.created_at|type)=="string")]' <<<"$run_pages")
+          duplicate_run_ids=$(jq '[group_by(.id)[] | select(length != 1)] | length' <<<"$flattened_runs")
+          test "$duplicate_run_ids" = 0
           sha="${{ needs.verify-source.outputs.source_sha }}"
-          ids=$(jq -r --argjson workflow_id "$workflow_id" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '[.workflow_runs[] | select(.workflow_id==$workflow_id and .path==".github/workflows/publish-sigreer-release.yml" and .name=="Publish sigreer release" and .head_sha==$workflow_sha and .event=="workflow_dispatch" and .conclusion=="success")] | sort_by(.created_at)|reverse | .[].id' <<<"$runs")
+          ids=$(jq -r --argjson workflow_id "$workflow_id" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" '[.[] | select(.workflow_id==$workflow_id and .path==".github/workflows/publish-sigreer-release.yml" and .name=="Publish sigreer release" and .head_sha==$workflow_sha and .event=="workflow_dispatch" and .conclusion=="success")] | sort_by([.created_at,.id])|reverse | .[].id' <<<"$flattened_runs")
           found=false
           for id in $ids; do
             candidate_dir=$(mktemp -d); candidate_rejected=false
