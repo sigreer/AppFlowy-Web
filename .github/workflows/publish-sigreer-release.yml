@@ -136,18 +136,18 @@ jobs:
           for id in $ids; do
             candidate_dir=$(mktemp -d); candidate_rejected=false
             if ! artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts"); then rm -rf "$candidate_dir"; continue; fi
-            artifact_inventory=$(jq -c '[.artifacts[] | select(.name|startswith("p2s3-result-"))]' <<<"$artifacts")
-            expired_artifacts=$(jq '[.[] | select(.expired==true)] | length' <<<"$artifact_inventory")
-            unexpected_artifacts=$(jq '[.[] | select(.name != "p2s3-result-appflowy-web")] | length' <<<"$artifact_inventory")
-            duplicate_artifacts=$(jq '[group_by(.name)[] | select(length != 1)] | length' <<<"$artifact_inventory")
-            missing_artifacts=$(jq 'if ([.[].name] == ["p2s3-result-appflowy-web"]) then 0 else 1 end' <<<"$artifact_inventory")
+            if ! artifact_inventory=$(jq -ce '[.artifacts[] | select(.name|startswith("p2s3-result-"))]' <<<"$artifacts") ||
+               ! expired_artifacts=$(jq -e '[.[] | select(.expired==true)] | length' <<<"$artifact_inventory") ||
+               ! unexpected_artifacts=$(jq -e '[.[] | select(.name != "p2s3-result-appflowy-web")] | length' <<<"$artifact_inventory") ||
+               ! duplicate_artifacts=$(jq -e '[group_by(.name)[] | select(length != 1)] | length' <<<"$artifact_inventory") ||
+               ! missing_artifacts=$(jq -e 'if ([.[].name] == ["p2s3-result-appflowy-web"]) then 0 else 1 end' <<<"$artifact_inventory"); then rm -rf "$candidate_dir"; continue; fi
             if test "$expired_artifacts" != 0 || test "$unexpected_artifacts" != 0 || test "$duplicate_artifacts" != 0 || test "$missing_artifacts" != 0; then rm -rf "$candidate_dir"; continue; fi
             mkdir "$candidate_dir/p2s3-result-appflowy-web"
-            url=$(jq -er '.[0].archive_download_url' <<<"$artifact_inventory")
+            if ! url=$(jq -er '.[0].archive_download_url' <<<"$artifact_inventory"); then rm -rf "$candidate_dir"; continue; fi
             if ! curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' "$url" -o "$candidate_dir/result.zip" || ! unzip -qq "$candidate_dir/result.zip" -d "$candidate_dir/p2s3-result-appflowy-web"; then candidate_rejected=true; fi
             if test "$candidate_rejected" = true || test "$(find "$candidate_dir/p2s3-result-appflowy-web" -type f -name result.json | wc -l)" != 1; then rm -rf "$candidate_dir"; continue; fi
             result="$candidate_dir/p2s3-result-appflowy-web/result.json"
-            distinct_recipes=$(jq -r '.recipe' "$result" | sort -u | wc -l)
+            if ! distinct_recipes=$(jq -er '.recipe' "$result" | sort -u | wc -l); then rm -rf "$candidate_dir"; continue; fi
             if ! jq -e --arg tag "$INPUT_SOURCE_TAG" --arg sha "$sha" --arg workflow_sha "$GITHUB_WORKFLOW_SHA" --argjson run_id "$id" '.recipe=="appflowy-web" and .mode=="rehearse" and .source_tag==$tag and .source_sha==$sha and .workflow_sha==$workflow_sha and .run_id==$run_id and .inspected==true' "$result" >/dev/null || test "$distinct_recipes" != 1; then candidate_rejected=true; fi
             rm -rf "$candidate_dir"
             if test "$candidate_rejected" = true; then continue; fi
