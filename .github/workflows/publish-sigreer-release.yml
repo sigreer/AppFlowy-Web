@@ -62,8 +62,11 @@ env:
       test -n "$realm"; test -n "$service"
       token=$(curl -fsSL -u "$GITHUB_ACTOR:$REGISTRY_TOKEN" -G "$realm" --data-urlencode "service=$service" --data-urlencode "scope=repository:$registry_path:pull" | jq -er '.token // .access_token')
       index_file=$(mktemp); status=$(curl -sS -o "$index_file" -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.index.v1+json' "https://ghcr.io/v2/$registry_path/referrers/$subject_digest")
-      if test "$status" = 200 && jq -e --arg bundle_type "$bundle_type" '(.schemaVersion==2) and (.manifests|length)==1 and .manifests[0].artifactType==$bundle_type' "$index_file" >/dev/null; then referrers_mode=oci-1.1-referrers-api
-      else curl -fsSL -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.index.v1+json' "https://ghcr.io/v2/$registry_path/manifests/$referrer_tag" >"$index_file"; jq -e --arg bundle_type "$bundle_type" '(.schemaVersion==2) and (.manifests|length)==1 and .manifests[0].artifactType==$bundle_type' "$index_file" >/dev/null; referrers_mode=oci-1.1-tag-fallback; fi
+      case "$status" in
+        200) jq -e --arg bundle_type "$bundle_type" '(.schemaVersion==2) and (.manifests|length)==1 and .manifests[0].artifactType==$bundle_type' "$index_file" >/dev/null; referrers_mode=oci-1.1-referrers-api ;;
+        404) curl -fsSL -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.index.v1+json' "https://ghcr.io/v2/$registry_path/manifests/$referrer_tag" >"$index_file"; jq -e --arg bundle_type "$bundle_type" '(.schemaVersion==2) and (.manifests|length)==1 and .manifests[0].artifactType==$bundle_type' "$index_file" >/dev/null; referrers_mode=oci-1.1-tag-fallback ;;
+        *) return 1 ;;
+      esac
       descriptor_digest=$(jq -er '.manifests[0].digest' "$index_file"); [[ "$descriptor_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
       manifest_file=$(mktemp); curl -fsSL -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/$registry_path/manifests/$descriptor_digest" >"$manifest_file"
       jq -e --arg subject_digest "$subject_digest" --arg bundle_type "$bundle_type" '.schemaVersion==2 and .artifactType==$bundle_type and .subject.digest==$subject_digest' "$manifest_file" >/dev/null
