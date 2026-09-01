@@ -70,7 +70,7 @@ env:
       descriptor_digest=$(jq -er '.manifests[0].digest' "$index_file"); [[ "$descriptor_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
       manifest_file=$(mktemp); curl -fsSL -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/$registry_path/manifests/$descriptor_digest" >"$manifest_file"
       jq -e --arg subject_digest "$subject_digest" --arg bundle_type "$bundle_type" '.schemaVersion==2 and .artifactType==$bundle_type and .subject.digest==$subject_digest' "$manifest_file" >/dev/null
-      legacy_status=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$registry_path/manifests/$referrer_tag.att"); test "$legacy_status" != 200 # legacy .att referrer forbidden
+      legacy_status=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$registry_path/manifests/$referrer_tag.att"); test "$legacy_status" = 404 # legacy .att referrer forbidden
       OBSERVED_REFERRERS_MODE=$referrers_mode; OBSERVED_BUNDLE_MEDIA_TYPE=$bundle_type; OBSERVED_REFERRER_TAG=$referrer_tag; OBSERVED_DESCRIPTOR_DIGEST=$descriptor_digest
     }
   BUILDX_METADATA_PROVENANCE: max
@@ -323,6 +323,11 @@ jobs:
       packages: write
       id-token: write
     steps:
+      - name: Guard reviewed workflow context
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: p2s3-oci-appflowy-web
@@ -411,6 +416,11 @@ jobs:
       packages: write
       id-token: write
     steps:
+      - name: Guard reviewed workflow context
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
       - name: Validate proof sentinels and build fixed image
         run: |
           set -euo pipefail
