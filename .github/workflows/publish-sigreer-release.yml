@@ -10,6 +10,7 @@ on:
         options:
           - rehearse
           - publish
+          - prove
       release_id:
         description: Immutable sigreer release identifier
         required: true
@@ -33,6 +34,7 @@ env:
   INPUT_SOURCE_TAG: ${{ inputs.source_tag }}
   SKOPEO_IMAGE: quay.io/skopeo/stable@sha256:0e392474a4383b733038b85eff26ade929d2ff10e8deead25a6add3ed79fb362
   SKOPEO_SOURCE_INDEX: quay.io/skopeo/stable@sha256:4a16d57b37617a04b3d643079a477a2848efe892dffcdf0ce56df4262b65f810
+  COSIGN_AMD64_SHA256: c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74
   BUILDX_METADATA_PROVENANCE: max
   INSPECT_OCI_SCRIPT: |
     verify_blob() {
@@ -90,6 +92,7 @@ env:
 
 jobs:
   verify-source:
+    if: inputs.mode != 'prove'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -104,6 +107,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$INPUT_MODE" == rehearse || "$INPUT_MODE" == publish ]]
           [[ "$INPUT_RELEASE_ID" =~ ^sigreer-p2s3-r[1-9][0-9]*$ ]]
           [[ "$INPUT_SOURCE_TAG" == "$INPUT_RELEASE_ID" ]]
           git fetch --force origin "refs/tags/$INPUT_SOURCE_TAG:refs/tags/$INPUT_SOURCE_TAG"
@@ -162,6 +166,7 @@ jobs:
           test "$found" = true
 
   build-appflowy-web:
+    if: inputs.mode != 'prove'
     needs: [verify-source, verify-publish-helper]
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -243,12 +248,23 @@ jobs:
           retention-days: 7
 
   verify-publish-helper:
+    if: inputs.mode != 'prove'
     needs: verify-source
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with: {cosign-release: v3.0.6}
+      - name: Verify pinned Cosign and bounded rehearsal predicate
+        run: |
+          set -euo pipefail
+          test "$(sha256sum "$(command -v cosign)" | cut -d' ' -f1)" = "$COSIGN_AMD64_SHA256"
+          cosign version | grep -F 'GitVersion: v3.0.6'
+          invocation="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg ref "refs/tags/$INPUT_SOURCE_TAG" --arg sha "${{ needs.verify-source.outputs.source_sha }}" --arg invocation "$invocation" '{buildDefinition:{buildType:"https://github.com/sigreer/appflowy/.github/workflows/publish-sigreer-release.yml@v1",externalParameters:{source:{repository:$repo,ref:$ref},recipe:"rehearsal"},internalParameters:{},resolvedDependencies:[{uri:("git+https://github.com/"+$repo+"@"+$ref),digest:{gitCommit:$sha}}]},runDetails:{builder:{id:("https://github.com/"+$repo+"/.github/workflows/publish-sigreer-release.yml@refs/heads/main")},metadata:{invocationId:$invocation}}}' >/tmp/predicate.json
+          jq -e --arg invocation "$invocation" '.buildDefinition.externalParameters.source.repository==env.GITHUB_REPOSITORY and .runDetails.metadata.invocationId==$invocation and (.buildDefinition.resolvedDependencies|length)==1' /tmp/predicate.json >/dev/null
       - name: Verify immutable linux-amd64 publish helper
         run: |
           set -euo pipefail
@@ -266,7 +282,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      attestations: write
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -299,6 +314,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
           logout: true
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with: {cosign-release: v3.0.6}
+      - name: Verify pinned Cosign
+        run: test "$(sha256sum "$(command -v cosign)" | cut -d' ' -f1)" = "$COSIGN_AMD64_SHA256"
       - name: Verify helper consumes registry credentials
         shell: bash
         run: |
@@ -317,13 +336,80 @@ jobs:
           test "$PRE_PUSH_MANIFEST_DIGEST" = "$REGISTRY_MANIFEST_DIGEST"
           echo "registry_manifest_digest=$REGISTRY_MANIFEST_DIGEST" >>"$GITHUB_OUTPUT"
           jq --arg registry_manifest_digest "$REGISTRY_MANIFEST_DIGEST" '.registry_manifest_digest=$registry_manifest_digest' /tmp/result/result.json > /tmp/published.json
-      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
-        with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/appflowy-web
-          subject-digest: ${{ steps.publish.outputs.registry_manifest_digest }}
-          push-to-registry: true
+      - name: Attest and immediately verify SLSA v1 provenance
+        env:
+          PACKAGE: ghcr.io/${{ github.repository_owner }}/appflowy-web
+          REGISTRY_MANIFEST_DIGEST: ${{ steps.publish.outputs.registry_manifest_digest }}
+        run: |
+          set -euo pipefail
+          package=${PACKAGE,,}; registry_manifest_digest=$REGISTRY_MANIFEST_DIGEST; repo=$GITHUB_REPOSITORY
+          predicate_file=$(mktemp); invocation="https://github.com/$repo/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          jq -n --arg repo "$repo" --arg ref "refs/tags/$INPUT_SOURCE_TAG" --arg sha "${{ needs.verify-source.outputs.source_sha }}" --arg invocation "$invocation" '{buildDefinition:{buildType:"https://github.com/sigreer/appflowy/.github/workflows/publish-sigreer-release.yml@v1",externalParameters:{source:{repository:$repo,ref:$ref},recipe:"appflowy-web"},internalParameters:{},resolvedDependencies:[{uri:("git+https://github.com/"+$repo+"@"+$ref),digest:{gitCommit:$sha}}]},runDetails:{builder:{id:("https://github.com/"+$repo+"/.github/workflows/publish-sigreer-release.yml@refs/heads/main")},metadata:{invocationId:$invocation}}}' >"$predicate_file"
+          jq -e --arg invocation "$invocation" '.buildDefinition.externalParameters.source.repository==env.GITHUB_REPOSITORY and .runDetails.metadata.invocationId==$invocation and (.buildDefinition.resolvedDependencies|length)==1' "$predicate_file" >/dev/null
+          cosign attest --yes --new-bundle-format=true --oidc-provider github-actions --type slsaprovenance1 --predicate "$predicate_file" "$package@$registry_manifest_digest"
+          cosign verify-attestation --new-bundle-format=true --type slsaprovenance1 --certificate-identity "https://github.com/$repo/.github/workflows/publish-sigreer-release.yml@refs/heads/main" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository "$repo" --certificate-github-workflow-ref refs/heads/main --certificate-github-workflow-sha "$GITHUB_SHA" --certificate-github-workflow-trigger workflow_dispatch "$package@$registry_manifest_digest" >/tmp/verified-attestation.json
+          jq -e 'length==1 and .[0].payloadType=="application/vnd.in-toto+json"' /tmp/verified-attestation.json >/dev/null
+          cosign tree "$package@$registry_manifest_digest" >/tmp/referrers.txt
+          ! grep -F '.att' /tmp/referrers.txt
+          referrer_tag="sha256-${registry_manifest_digest#sha256:}"
+          if grep -F "$referrer_tag" /tmp/referrers.txt; then referrers_mode=oci-1.1-tag-fallback
+          elif grep -Eqi 'attestation|bundle' /tmp/referrers.txt; then referrers_mode=oci-1.1-referrers-api
+          else cat /tmp/referrers.txt >&2; exit 1; fi
+          jq --arg mode "$referrers_mode" --arg media_type application/vnd.dev.sigstore.bundle.v0.3+json --arg referrer_tag "$referrer_tag" '.provenance={mechanism:"cosign",predicate_type:"https://slsa.dev/provenance/v1",bundle_media_type:$media_type,referrers_mode:$mode,referrer_tag:(if $mode=="oci-1.1-tag-fallback" then $referrer_tag else null end),verified:true}' /tmp/published.json >/tmp/published.with-provenance.json
+          mv /tmp/published.with-provenance.json /tmp/published.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2s3-published-appflowy-web
           path: /tmp/published.json
           retention-days: 7
+
+  prove-cosign:
+    if: inputs.mode == 'prove'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: p2s3-proof-${{ github.repository }}-${{ github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Validate proof sentinels and build fixed image
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_RELEASE_ID" == p2s3-proof ]]
+          [[ "$INPUT_SOURCE_TAG" == p2s3-proof ]]
+          proof_name="p2s3-cosign-preflight-web-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}"
+          [[ "$proof_name" =~ ^p2s3-cosign-preflight-web-[0-9]{8}-[0-9]+$ ]]
+          tmp=$(mktemp -d); printf 'p2s3 cosign proof\n' >"$tmp/proof.txt"
+          printf 'FROM scratch\nCOPY proof.txt /proof.txt\n' >"$tmp/Dockerfile"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$proof_name:proof-${GITHUB_RUN_ID}"
+          docker build --platform linux/amd64 -t "$image" "$tmp"
+          echo "image=$image" >>"$GITHUB_ENV"; echo "proof_name=$proof_name" >>"$GITHUB_ENV"
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ github.token }}", logout: true}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with: {cosign-release: v3.0.6}
+      - name: Push, attest, verify, and classify OCI referrer
+        run: |
+          set -euo pipefail
+          test "$(sha256sum "$(command -v cosign)" | cut -d' ' -f1)" = "$COSIGN_AMD64_SHA256"
+          push_output=$(docker push "$image" 2>&1); printf '%s\n' "$push_output"
+          registry_manifest_digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]\{64\}\).*$/\1/p' <<<"$push_output" | tail -1)
+          [[ "$registry_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          package=${image%:*}; repo=$GITHUB_REPOSITORY; predicate_file=$(mktemp)
+          invocation="https://github.com/$repo/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          jq -n --arg repo "$repo" --arg sha "$GITHUB_SHA" --arg invocation "$invocation" '{buildDefinition:{buildType:"https://github.com/sigreer/appflowy/.github/workflows/publish-sigreer-release.yml@v1",externalParameters:{source:{repository:$repo,ref:"refs/heads/main"},recipe:"fixed-proof"},internalParameters:{},resolvedDependencies:[{uri:("git+https://github.com/"+$repo+"@refs/heads/main"),digest:{gitCommit:$sha}}]},runDetails:{builder:{id:("https://github.com/"+$repo+"/.github/workflows/publish-sigreer-release.yml@refs/heads/main")},metadata:{invocationId:$invocation}}}' >"$predicate_file"
+          jq -e --arg invocation "$invocation" '.buildDefinition.externalParameters.source.repository==env.GITHUB_REPOSITORY and .runDetails.metadata.invocationId==$invocation and (.buildDefinition.resolvedDependencies|length)==1' "$predicate_file" >/dev/null
+          cosign attest --yes --new-bundle-format=true --oidc-provider github-actions --type slsaprovenance1 --predicate "$predicate_file" "$package@$registry_manifest_digest"
+          cosign verify-attestation --new-bundle-format=true --type slsaprovenance1 --certificate-identity "https://github.com/$repo/.github/workflows/publish-sigreer-release.yml@refs/heads/main" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository "$repo" --certificate-github-workflow-ref refs/heads/main --certificate-github-workflow-sha "$GITHUB_SHA" --certificate-github-workflow-trigger workflow_dispatch "$package@$registry_manifest_digest" >/tmp/verified-attestation.json
+          cosign tree "$package@$registry_manifest_digest" >/tmp/referrers.txt
+          ! grep -F '.att' /tmp/referrers.txt
+          referrer_tag="sha256-${registry_manifest_digest#sha256:}"
+          if grep -F "$referrer_tag" /tmp/referrers.txt; then referrers_mode=oci-1.1-tag-fallback
+          elif grep -Eqi 'attestation|bundle' /tmp/referrers.txt; then referrers_mode=oci-1.1-referrers-api
+          else cat /tmp/referrers.txt >&2; exit 1; fi
+          jq -n --arg package "$package" --arg digest "$registry_manifest_digest" --arg media_type application/vnd.dev.sigstore.bundle.v0.3+json --arg mode "$referrers_mode" --arg referrer_tag "$referrer_tag" '{package:$package,subject_digest:$digest,predicate_type:"https://slsa.dev/provenance/v1",bundle_media_type:$media_type,referrers_mode:$mode,referrer_tag:(if $mode=="oci-1.1-tag-fallback" then $referrer_tag else null end),verified:true}' >/tmp/proof-result.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: p2s3-cosign-proof-web, path: /tmp/proof-result.json, retention-days: 7}
