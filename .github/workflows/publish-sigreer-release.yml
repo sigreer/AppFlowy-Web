@@ -58,7 +58,7 @@ env:
       verify_fetched_blob() {
         local file=$1 digest=$2 size=$3 actual
         [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-        [[ "$size" =~ ^[1-9][0-9]*$ ]]; test "$size" -le "$P2S3_MAX_BLOB_BYTES"
+        [[ "$size" =~ ^[1-9][0-9]*$ ]]
         test "$(wc -c <"$file")" -eq "$size"
         actual=$(sha256sum "$file" | cut -d' ' -f1)
         test "sha256:$actual" = "$digest"
@@ -146,17 +146,19 @@ env:
         test "$status" = 200; require_content_type "$header_file" "$expected_type"
       }
       fetch_registry_blob() (
-        local url=$1 output=$2 digest=$3 size=$4 token=$5 private header initial status
+        local registry_path=$1 output=$2 digest=$3 size=$4 token=$5 endpoint=${6:-blobs} url private header initial status rc
         blob_fail() { echo "P2S3_BLOB_REDIRECT_ERROR class=$1 digest=$digest" >&2; return 1; }
         case $- in *x*) blob_fail xtrace-enabled; return;; esac
         test "${ACTIONS_STEP_DEBUG:-false}" != true || { blob_fail actions-step-debug-enabled; return; }
         test "${RUNNER_DEBUG:-0}" != 1 || { blob_fail runner-debug-enabled; return; }
+        [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { blob_fail malformed-requested-digest; return; }
         [[ "$size" =~ ^[1-9][0-9]*$ ]] || { blob_fail descriptor-size-mismatch; return; }
         test "$size" -le "$P2S3_MAX_BLOB_BYTES" || { blob_fail oversized-body; return; }
-        [[ "$url" == https://ghcr.io/v2/*/blobs/"$digest" ]] || { blob_fail manifest-307; return; }
+        test "$endpoint" = blobs || { blob_fail manifest-307; return; }
+        url="https://ghcr.io/v2/$registry_path/blobs/$digest"
         private=$(mktemp -d); chmod 700 "$private"; header=$private/registry.headers; initial=$private/registry.body
         trap 'rm -rf "$private"' EXIT
-        status=$(secure_registry_curl -sS -D "$header" -o "$initial" -w '%{http_code}' --max-filesize "$((size + 1))" -H "Authorization: Bearer $token" -H 'Accept: application/octet-stream' "$url") || { blob_fail oversized-body; return; }
+        if status=$(secure_registry_curl -sS -D "$header" -o "$initial" -w '%{http_code}' --max-filesize "$((size + 1))" -H "Authorization: Bearer $token" -H 'Accept: application/octet-stream' "$url"); then :; else rc=$?; if test "$rc" -eq 63; then blob_fail oversized-body; else blob_fail initial-transport-failure; fi; return; fi
         case "$status" in
           200) require_content_type "$header" application/octet-stream || { blob_fail terminal-wrong-content-type; return; }; mv "$initial" "$output" ;;
           307) validate_blob_redirect "$header" "$initial" "$output" "$digest" "$size" "$private" || return ;;
@@ -188,8 +190,8 @@ env:
       manifest_file=$(mktemp); fetch_registry "https://ghcr.io/v2/$registry_path/manifests/$descriptor_digest" "$manifest_file" application/vnd.oci.image.manifest.v1+json "$token"; verify_fetched_blob "$manifest_file" "$descriptor_digest" "$descriptor_size"
       jq -e --arg subject_digest "$subject_digest" --arg bundle_type "$bundle_type" --arg empty_type "$empty_type" 'type=="object" and keys==["annotations","artifactType","config","layers","mediaType","schemaVersion","subject"] and .schemaVersion==2 and .mediaType=="application/vnd.oci.image.manifest.v1+json" and .artifactType==$bundle_type and (.subject|keys==["digest","mediaType","size"]) and .subject.digest==$subject_digest and (.config|keys==["artifactType","digest","mediaType","size"]) and .config.mediaType==$empty_type and .config.artifactType==$bundle_type and .config.size==2 and .config.digest=="sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a" and (.layers|length)==1 and (.layers[0]|keys==["digest","mediaType","size"]) and .layers[0].mediaType==$bundle_type and (.annotations|keys==["dev.sigstore.bundle.content","dev.sigstore.bundle.predicateType","org.opencontainers.image.created"]) and .annotations["dev.sigstore.bundle.content"]=="dsse-envelope" and .annotations["dev.sigstore.bundle.predicateType"]=="https://sigstore.dev/cosign/sign/v1" and (.annotations["org.opencontainers.image.created"]|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))' "$manifest_file" >/dev/null
       subject_media=$(jq -er '.subject.mediaType' "$manifest_file"); subject_size=$(jq -er '.subject.size' "$manifest_file"); subject_file=$(mktemp); fetch_registry "https://ghcr.io/v2/$registry_path/manifests/$subject_digest" "$subject_file" "$subject_media" "$token"; verify_fetched_blob "$subject_file" "$subject_digest" "$subject_size"
-        config_digest=$(jq -er '.config.digest' "$manifest_file"); config_size=$(jq -er '.config.size' "$manifest_file"); config_file=$(mktemp); fetch_registry_blob "https://ghcr.io/v2/$registry_path/blobs/$config_digest" "$config_file" "$config_digest" "$config_size" "$token"; config_raw=$(cat "$config_file"); test "$config_raw" = "{}"
-        bundle_digest=$(jq -er '.layers[0].digest' "$manifest_file"); bundle_size=$(jq -er '.layers[0].size' "$manifest_file"); bundle_file=$(mktemp); fetch_registry_blob "https://ghcr.io/v2/$registry_path/blobs/$bundle_digest" "$bundle_file" "$bundle_digest" "$bundle_size" "$token"
+        config_digest=$(jq -er '.config.digest' "$manifest_file"); config_size=$(jq -er '.config.size' "$manifest_file"); config_file=$(mktemp); fetch_registry_blob "$registry_path" "$config_file" "$config_digest" "$config_size" "$token"; config_raw=$(cat "$config_file"); test "$config_raw" = "{}"
+        bundle_digest=$(jq -er '.layers[0].digest' "$manifest_file"); bundle_size=$(jq -er '.layers[0].size' "$manifest_file"); bundle_file=$(mktemp); fetch_registry_blob "$registry_path" "$bundle_file" "$bundle_digest" "$bundle_size" "$token"
       jq -e --arg bundle_type "$bundle_type" 'type=="object" and keys==["dsseEnvelope","mediaType","verificationMaterial"] and .mediaType==$bundle_type and (.dsseEnvelope|type)=="object" and (.dsseEnvelope|keys)==["payload","payloadType","signatures"]' "$bundle_file" >/dev/null
       verified_envelope=$(jq -S -c . "$verified_file"); bundle_envelope=$(jq -S -c .dsseEnvelope "$bundle_file"); test "$verified_envelope" = "$bundle_envelope"
         legacy_status=$(secure_registry_curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$registry_path/manifests/$referrer_tag.att"); test "$legacy_status" = 404 # legacy .att referrer forbidden
