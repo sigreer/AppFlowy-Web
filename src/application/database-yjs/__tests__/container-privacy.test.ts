@@ -12,24 +12,113 @@ const bytes = (key: string): Uint8Array => Uint8Array.from(fixture[key]);
 // Yjs 14.0.0-1 does not export decodeUpdate. Its supported logUpdate entrypoint
 // calls LazyStructReader/readDeleteSet. Capture the typed objects at its output
 // sink; never parse console text or mock any encoder/decoder/application path.
+function requireShape(condition: unknown): asserts condition {
+  if (!condition) throw new Error('Unexpected pinned decoder output shape');
+}
+function uint(value: unknown, max = Number.MAX_SAFE_INTEGER): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= max;
+}
+const idPrototype = Object.getPrototypeOf(Y.createID(1, 0));
+const deleteSetPrototype = Object.getPrototypeOf(Y.createDeleteSet());
+const deleteRangePrototype = (() => {
+  const doc = new Y.Doc();
+  doc.getText('shape').insert(0, 'x');
+  doc.getText('shape').delete(0, 1);
+  const set = Y.createDeleteSetFromStructStore(doc.store);
+  const prototype = Object.getPrototypeOf([...set.clients.values()][0][0]);
+  doc.destroy();
+  return prototype;
+})();
+function validateID(id: unknown) {
+  requireShape(id && Object.getPrototypeOf(id) === idPrototype);
+  const value = id as { client: unknown; clock: unknown };
+  requireShape(uint(value.client) && uint(value.clock, 0xffffffff));
+}
+function validatePayload(value: unknown, parents = new Set<unknown>()) {
+  if (value === null || ['undefined', 'string', 'boolean', 'number', 'bigint'].includes(typeof value)) return;
+  requireShape(typeof value === 'object' && !parents.has(value));
+  if (value instanceof Uint8Array) return;
+  requireShape(Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype);
+  parents.add(value);
+  Object.values(value as object).forEach((child) => validatePayload(child, parents));
+  parents.delete(value);
+}
+function validateContent(content: Y.Item['content'], length: number) {
+  requireShape(content && typeof content === 'object');
+  let keys: string[];
+  if (content instanceof Y.ContentString) {
+    keys = ['str'];
+    requireShape(typeof content.str === 'string');
+  } else if (content instanceof Y.ContentAny || content instanceof Y.ContentJSON) {
+    keys = ['arr'];
+    requireShape(Array.isArray(content.arr));
+    validatePayload(content.arr);
+  } else if (content instanceof Y.ContentEmbed) {
+    keys = ['embed'];
+    validatePayload(content.embed);
+  } else if (content instanceof Y.ContentFormat) {
+    keys = ['key', 'value'];
+    requireShape(typeof content.key === 'string');
+    validatePayload(content.value);
+  } else if (content instanceof Y.ContentBinary) {
+    keys = ['content'];
+    requireShape(content.content instanceof Uint8Array);
+  } else if (content instanceof Y.ContentDeleted) {
+    keys = ['len'];
+    requireShape(uint(content.len, 0xffffffff) && content.len > 0);
+  } else if (content instanceof Y.ContentType) {
+    keys = ['type'];
+    // This corpus uses maps and text. Fail closed on other shared types until
+    // their metadata (e.g. XML tag names) is covered by the semantic inventory.
+    requireShape(content.type instanceof Y.Map || content.type instanceof Y.Text);
+  } else throw new Error('Unsupported pinned ItemContent class');
+  requireShape(Object.keys(content).sort().join(',') === keys.sort().join(','));
+  requireShape(content.getLength() === length);
+}
+function validateCapturedOutput(calls: unknown[][]) {
+  requireShape(calls.length === 2 && calls.every((args) => args.length === 2));
+  requireShape(calls[0][0] === 'Structs: ' && calls[1][0] === 'DeleteSet: ');
+  const structs = calls[0][1] as Array<Y.Item | Y.GC | Y.Skip>;
+  const ds = calls[1][1] as { clients: Map<number, Array<{ clock: number; len: number }>> };
+  requireShape(Array.isArray(structs) && ds && Object.getPrototypeOf(ds) === deleteSetPrototype);
+  requireShape(Object.keys(ds).join(',') === 'clients' && ds.clients instanceof Map);
+  for (const [client, ranges] of ds.clients) {
+    requireShape(uint(client) && Array.isArray(ranges) && ranges.length > 0);
+    let lastEnd = -1;
+    for (const range of ranges) {
+      requireShape(range && Object.getPrototypeOf(range) === deleteRangePrototype);
+      requireShape(Object.keys(range).sort().join(',') === 'clock,len');
+      requireShape(uint(range.clock, 0xffffffff) && uint(range.len, 0xffffffff) && range.len > 0);
+      requireShape(uint(range.clock + range.len, 0xffffffff) && range.clock >= lastEnd);
+      lastEnd = range.clock + range.len;
+    }
+  }
+  for (const struct of structs) {
+    requireShape(struct instanceof Y.Item || struct instanceof Y.GC || struct instanceof Y.Skip);
+    validateID(struct.id);
+    requireShape(
+      uint(struct.length, 0xffffffff) && struct.length > 0 && uint(struct.id.clock + struct.length, 0xffffffff)
+    );
+    if (struct instanceof Y.Item) {
+      for (const id of [struct.origin, struct.rightOrigin]) if (id !== null) validateID(id);
+      if (struct.parent !== null && typeof struct.parent !== 'string') validateID(struct.parent);
+      requireShape(struct.parentSub === null || typeof struct.parentSub === 'string');
+      validateContent(struct.content, struct.length);
+    }
+  }
+  return { structs, ds };
+}
 function decodePinnedUpdate(update: Uint8Array) {
-  let structs: Array<Y.Item | Y.GC | Y.Skip> | undefined;
-  let ds: { clients: Map<number, unknown> } | undefined;
+  const calls: unknown[][] = [];
   const sink = jest.spyOn(logging, 'print').mockImplementation((...args: unknown[]) => {
-    if (args[0] === 'Structs: ') structs = args[1] as typeof structs;
-    else if (args[0] === 'DeleteSet: ') ds = args[1] as typeof ds;
-    else throw new Error('Unexpected pinned decoder output');
+    calls.push(args);
   });
   try {
     Y.logUpdate(update);
   } finally {
     sink.mockRestore();
   }
-  if (!Array.isArray(structs) || !ds || !(ds.clients instanceof Map))
-    throw new Error('Pinned decoder did not yield structs and delete set');
-  if (!structs.every((s) => s instanceof Y.Item || s instanceof Y.GC || s instanceof Y.Skip))
-    throw new Error('Unexpected decoded struct type');
-  return { structs, ds };
+  return validateCapturedOutput(calls);
 }
 
 function raw(key: string) {
@@ -107,5 +196,86 @@ describe('raw_archive_gate cross-language committed update privacy', () => {
     localText.insert(localText.length, ' + pending local edit');
     Y.applyUpdate(stale, bytes('sanitized'));
     assertSurvivor(stale);
+  });
+});
+
+// Negative controls validate the capture boundary only. The positive path always
+// uses real pinned Yjs decoding; no fabricated object is used as fixture evidence.
+describe('pinned decoder capture fails closed', () => {
+  function captured() {
+    const { structs, ds } = decodePinnedUpdate(bytes('sanitized'));
+    return [
+      ['Structs: ', structs],
+      ['DeleteSet: ', ds],
+    ] as unknown[][];
+  }
+  test('rejects missing, duplicate, reordered and extra decoder output', () => {
+    const calls = captured();
+    for (const bad of [calls.slice(0, 1), [...calls, calls[1]], [...calls].reverse(), [...calls, ['unexpected']]]) {
+      expect(() => validateCapturedOutput(bad)).toThrow();
+    }
+  });
+  test('rejects plain or malformed delete range and invalid client clocks', () => {
+    for (const range of [{ clock: 0, len: 1 }, { clock: -1, len: 0 }, null]) {
+      const calls = captured();
+      (calls[1][1] as { clients: Map<number, unknown> }).clients.set(101, [range]);
+      expect(() => validateCapturedOutput(calls)).toThrow();
+    }
+  });
+  test('rejects bounded-range violations on real decoded range objects', () => {
+    for (const corrupt of [
+      (ds: ReturnType<typeof decodePinnedUpdate>['ds']) => {
+        ds.clients.set(-1, [...ds.clients.values()][0]);
+      },
+      (ds: ReturnType<typeof decodePinnedUpdate>['ds']) => {
+        [...ds.clients.values()][0][0].len = 0;
+      },
+      (ds: ReturnType<typeof decodePinnedUpdate>['ds']) => {
+        [...ds.clients.values()][0][0].clock = Number.MAX_SAFE_INTEGER;
+      },
+    ]) {
+      const { structs, ds } = decodePinnedUpdate(bytes('delete_only'));
+      corrupt(ds);
+      expect(() =>
+        validateCapturedOutput([
+          ['Structs: ', structs],
+          ['DeleteSet: ', ds],
+        ])
+      ).toThrow();
+    }
+  });
+  test('rejects malformed payload on a real decoded content class', () => {
+    const { structs, ds } = decodePinnedUpdate(bytes('pretrash'));
+    const item = structs.find((s) => s instanceof Y.Item && s.content instanceof Y.ContentString) as Y.Item;
+    (item.content as Y.ContentString).str = 123 as unknown as string;
+    expect(() =>
+      validateCapturedOutput([
+        ['Structs: ', structs],
+        ['DeleteSet: ', ds],
+      ])
+    ).toThrow();
+  });
+  test('restores the real output sink when decoding truncated bytes throws', () => {
+    const original = logging.print;
+    expect(() => decodePinnedUpdate(Uint8Array.of(1))).toThrow();
+    expect(logging.print).toBe(original);
+  });
+  test('rejects malformed item content and impossible IDs', () => {
+    for (const corrupt of [
+      (item: Y.Item) => {
+        item.content = {} as typeof item.content;
+      },
+      (item: Y.Item) => {
+        item.id.clock = -1;
+      },
+      (item: Y.Item) => {
+        item.length = 0;
+      },
+    ]) {
+      const calls = captured();
+      const item = (calls[0][1] as Y.Item[]).find((s) => s instanceof Y.Item)!;
+      corrupt(item);
+      expect(() => validateCapturedOutput(calls)).toThrow();
+    }
   });
 });
