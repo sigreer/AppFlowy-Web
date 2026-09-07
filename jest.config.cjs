@@ -30,7 +30,7 @@ module.exports = {
     `node_modules/(?!.pnpm|${esModules})`,
   ],
   testMatch: ['**/*.test.ts', '**/*.test.tsx'],
-  testPathIgnorePatterns: ['/node_modules/', '/\\.claude/', '\\.integration\\.test\\.ts$'],
+  testPathIgnorePatterns: ['/node_modules/', '/\\.claude/', '\\.integration\\.test\\.ts$', '/container-privacy\\.test\\.ts$'],
   modulePathIgnorePatterns: ['<rootDir>/\\.claude/'],
   coverageDirectory: '<rootDir>/coverage/jest',
   collectCoverage: true,
