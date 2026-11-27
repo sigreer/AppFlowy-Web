@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build stage
-FROM node:20.12.0-alpine AS builder
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS builder
 
 # Set production environment
 ENV NODE_ENV=production
@@ -21,10 +21,10 @@ COPY . .
 RUN pnpm run build
 
 # Production stage
-FROM nginx:1.25-alpine
+FROM nginx:1.31.10-alpine@sha256:7fc0fb4af7bf006aeb31aea88069976060f8f0a0a86b667126742cc17f4e31ae
 
 # Install runtime dependencies
-RUN apk add --no-cache tini
+RUN apk upgrade --no-cache && apk add --no-cache tini
 
 # Copy built application
 COPY --from=builder /app/dist /usr/share/nginx/html/
